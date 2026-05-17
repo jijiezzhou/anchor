@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Envs
+.venv/
+.env
+.env.local
+
+# Builds
+dist/
+build/
+
+# Anchor local state (the vector + graph indices live under ~/.anchor, but in
+# case anyone bind-mounts it into the repo, ignore it.)
+.anchor/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local AI assistant scratch
+CLAUDE.md
+.claude/
