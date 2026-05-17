@@ -1,6 +1,6 @@
 """Anchor CLI — entry point for the cumulative capstone.
 
-Subcommands grow each week. Today (weeks 1–7):
+Subcommands grow each week. Today (weeks 1–8):
 
     anchor parse    <vault>             show parsed-graph stats (notes, links, tags, broken)
     anchor index    <vault>             embed only what changed (incremental; --rebuild for full)
@@ -12,6 +12,7 @@ Subcommands grow each week. Today (weeks 1–7):
     anchor route    "..."               week-5 router: classify lookup / synthesis / exploration
     anchor ask      "..." --vault PATH  retrieve + answer (default: route; --hybrid / --graph force a mode)
     anchor eval     {generate,run,show} week-7 eval suite — MRR/Recall@k + LLM-as-judge
+    anchor mcp                          week-8 MCP server over stdio (Claude Code / Cursor / Desktop)
     anchor chat     "..."               bare LLM call, useful for sanity-checking the backend
 
 Backends:
@@ -611,6 +612,45 @@ def chat_cmd(
     for chunk in llm.stream(prompt, temperature=temperature, system=system):
         console.print(chunk, end="", soft_wrap=True, highlight=False, markup=False)
     console.print()
+
+
+@app.command("mcp")
+def mcp_cmd(
+    vault: Path = typer.Option(
+        None, "-v", "--vault",
+        help="Default vault for tool calls. Falls back to $ANCHOR_VAULT.",
+    ),
+    backend: str = typer.Option(None, "--backend",
+                                 help="Override ANCHOR_BACKEND for the server's LLM."),
+    model: str = typer.Option(None, "--model",
+                               help="Override the model used by the server."),
+):
+    """Start the MCP server on stdio. Wire this into Claude Code / Cursor /
+    Claude Desktop via your client's MCP config. Two tools are exposed:
+
+    - `anchor_ask`     — router-driven retrieve + answer
+    - `anchor_expand`  — graph-expanded raw candidates (no LLM answer)
+
+    The server runs until the client disconnects. Logging goes to stderr
+    so it never pollutes the JSON-RPC stream on stdout."""
+    import asyncio
+    import sys
+    from anchor.mcp.server import run_stdio
+
+    if vault is not None:
+        os.environ["ANCHOR_VAULT"] = str(vault.resolve())
+    llm = LLM(model=model, backend=backend)
+
+    # Stderr is the only safe place to write — stdout is the MCP transport.
+    print(
+        f"[anchor mcp] starting  vault={os.environ.get('ANCHOR_VAULT', '(unset)')}  "
+        f"llm={llm.backend}:{llm.model}",
+        file=sys.stderr, flush=True,
+    )
+    try:
+        asyncio.run(run_stdio(default_llm=llm))
+    except KeyboardInterrupt:
+        print("[anchor mcp] stopped", file=sys.stderr, flush=True)
 
 
 @eval_app.command("generate")
