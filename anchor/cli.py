@@ -1,10 +1,11 @@
 """Anchor CLI — entry point for the cumulative capstone.
 
-Subcommands grow each week. Today (weeks 1–5):
+Subcommands grow each week. Today (weeks 1–6):
 
     anchor parse    <vault>             show parsed-graph stats (notes, links, tags, broken)
-    anchor index    <vault>             embed every chunk into the local vector store
+    anchor index    <vault>             embed only what changed (incremental; --rebuild for full)
     anchor sync     <vault>             upsert vault into the SQLite graph DB (incremental)
+    anchor watch    <vault>             week-6 poll loop: sync + incremental index on file change
     anchor search   "..." --vault PATH  BM25 lexical hits from the graph DB
     anchor retrieve "..." --vault PATH  hybrid (vector+BM25+tag+title) seed set
     anchor expand   "..." --vault PATH  hybrid → graph walk (1-2 hops), week-4 full retrieval
@@ -107,7 +108,11 @@ def index_cmd(
         help="Wipe the existing vector collection and re-embed from scratch.",
     ),
 ):
-    """Embed every chunk into the local Chroma store (week 1, naive baseline)."""
+    """Embed changed chunks into the local Chroma store.
+
+    Incremental by default (week 6): chunks whose source note's mtime
+    hasn't moved are skipped; orphans from deleted notes or renamed
+    sections are dropped. Use --rebuild after a chunker change."""
     from anchor.index.vectors import INDEX_ROOT, index_vault
 
     vault_resolved = vault.resolve()
@@ -129,9 +134,20 @@ def index_cmd(
     stats = index_vault(vault_resolved, rebuild=rebuild, progress=progress)
     elapsed = time.perf_counter() - started
 
+    embedded = stats.get("embedded", stats["chunks"])
+    unchanged = stats.get("unchanged", 0)
+    removed = stats.get("removed", 0)
+    detail_bits = []
+    if embedded:
+        detail_bits.append(f"{embedded} embedded")
+    if unchanged:
+        detail_bits.append(f"{unchanged} unchanged")
+    if removed:
+        detail_bits.append(f"{removed} removed")
+    detail = "  •  ".join(detail_bits) or "no chunks"
     console.print(
-        f"\n[bold]Indexed {stats['notes']} notes / {stats['chunks']} chunks[/bold] "
-        f"[dim]in {elapsed:.1f}s[/dim]"
+        f"\n[bold]Indexed {stats['notes']} notes / {stats['chunks']} chunks[/bold]  "
+        f"[dim]({detail})  in {elapsed:.1f}s[/dim]"
     )
 
 
@@ -172,6 +188,80 @@ def sync_cmd(
         for label, paths in (("added", stats.added), ("changed", stats.changed), ("removed", stats.removed)):
             for p in paths:
                 console.print(f"  [yellow]{label:<8}[/yellow] {p}")
+
+
+@app.command("watch")
+def watch_cmd(
+    vault: Path = typer.Argument(
+        ..., exists=True, file_okay=False, dir_okay=True, readable=True,
+        help="Path to the markdown vault root.",
+    ),
+    poll_interval: float = typer.Option(
+        2.0, "--poll-interval", min=0.2, max=60.0,
+        help="Seconds between polls. Lower = snappier, higher = quieter.",
+    ),
+    no_vector: bool = typer.Option(
+        False, "--no-vector",
+        help="Skip incremental vector indexing; only keep the graph DB in sync.",
+    ),
+    once: bool = typer.Option(
+        False, "--once",
+        help="Run a single tick and exit (useful for cron, CI, or smoke tests).",
+    ),
+    backend: str = typer.Option(None, "--backend",
+                                 help="Override ANCHOR_BACKEND for embeddings."),
+    model: str = typer.Option(None, "--model",
+                               help="Override the model used for embeddings."),
+):
+    """Poll the vault for changes and keep the graph DB + vector index fresh.
+
+    Sub-second per tick on a small vault; the cost only goes up when files
+    actually change. Ctrl-C to stop. Pair with --no-vector when Ollama is
+    down — the graph stays current and embeddings re-converge on the next
+    full run."""
+    from anchor.watch import TickResult, watch as watch_loop
+
+    vault_resolved = vault.resolve()
+    llm = None if no_vector else LLM(model=model, backend=backend)
+    backend_label = "no-vector" if no_vector else f"{llm.backend}:{llm.model}"
+    console.print(
+        f"[dim]watching {vault_resolved}\n"
+        f"  interval={poll_interval}s  vectors={backend_label}\n"
+        f"  Ctrl-C to stop[/dim]"
+    )
+
+    def on_tick(res: TickResult) -> None:
+        if res.error:
+            console.print(f"[red]✗[/red] {res.error}")
+            return
+        if not res.touched:
+            return
+        parts: list[str] = []
+        if res.added:
+            parts.append(f"[green]+{len(res.added)}[/green]")
+        if res.changed:
+            parts.append(f"[yellow]~{len(res.changed)}[/yellow]")
+        if res.removed:
+            parts.append(f"[red]-{len(res.removed)}[/red]")
+        suffix_bits: list[str] = []
+        if res.embedded:
+            suffix_bits.append(f"embedded={res.embedded}")
+        if res.removed_chunks:
+            suffix_bits.append(f"orphans={res.removed_chunks}")
+        suffix = ("  " + "  ".join(suffix_bits)) if suffix_bits else ""
+        console.print(f"  {' '.join(parts)}{suffix}  [dim]({res.elapsed_s*1000:.0f} ms)[/dim]")
+
+    try:
+        watch_loop(
+            vault_resolved,
+            poll_seconds=poll_interval,
+            include_vector=not no_vector,
+            llm=llm,
+            on_tick=on_tick,
+            max_ticks=1 if once else None,
+        )
+    except KeyboardInterrupt:
+        console.print("\n[dim]stopped[/dim]")
 
 
 @app.command("search")

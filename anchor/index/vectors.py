@@ -6,6 +6,12 @@ What makes it deliberately naive:
     - Cosine over text embeddings only. No tag filter, no recency boost.
     - Per-vault Chroma collection on disk under ~/.anchor/chroma/<vault-name>/.
 
+Week 6 made `index_vault` incremental: chunks whose source note's mtime
+matches what's stored in Chroma are skipped, orphans (deleted notes,
+renamed sections) are removed, and embed/upsert work runs in small
+batches so a partial failure leaves what *did* embed intact for the
+next run to pick up.
+
 Later weeks layer BM25 + graph expansion on top; this module is intentionally
 left thin so the contrast is sharp in the demos."""
 
@@ -80,52 +86,111 @@ def _collection_for(vault: Path):
     return client, client.get_or_create_collection(name=vault_name, metadata={"hnsw:space": "cosine"})
 
 
+# Embed + upsert batch size. Small enough that a partial failure (Ollama
+# restart, network blip on a remote backend) leaves at most this many
+# chunks unfinished, and the next run will pick them up because Chroma
+# never saw their IDs. Big enough that per-batch overhead doesn't dominate.
+DEFAULT_BATCH_SIZE = 32
+
+
 def index_vault(
     vault: str | Path,
     *,
     llm: Optional[LLM] = None,
     rebuild: bool = False,
     progress: Optional[Callable[[int, int], None]] = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict:
-    """Parse the vault, chunk every note, embed, store. Idempotent unless
-    `rebuild=True` (which wipes the collection first)."""
+    """Parse the vault, chunk every note, embed only what changed since the
+    last run, store. Idempotent: re-running on an unchanged vault embeds
+    nothing.
+
+    Change detection is per-note via mtime stored as Chroma metadata. When a
+    note's mtime moves, all of that note's chunks are re-embedded (cheaper
+    than chunk-level diffing — sections rarely change in isolation). Chunks
+    whose IDs no longer appear in the current parse are deleted as orphans
+    (covers note deletes and section renames in one pass).
+
+    `rebuild=True` wipes the collection first — useful after a chunker
+    change when stored embeddings no longer match how the chunker would
+    chunk today.
+
+    Returns a stats dict: notes, chunks (current), embedded (this run),
+    removed (orphans dropped), unchanged.
+    """
     vault_path = Path(vault).expanduser().resolve()
     notes = parse_vault(vault_path)
     chunks = chunks_for_vault(notes)
     llm = llm or LLM()
+    note_mtimes = {n.path: n.mtime for n in notes}
 
     client, collection = _collection_for(vault_path)
     if rebuild:
         client.delete_collection(name=collection.name)
         _, collection = _collection_for(vault_path)
 
-    if not chunks:
-        return {"notes": len(notes), "chunks": 0}
+    existing = _existing_chunk_summary(collection)
+    current_ids = {c.id for c in chunks}
 
-    embeddings = []
-    texts = []
-    ids = []
-    metadatas = []
-    total = len(chunks)
-    for i, ch in enumerate(chunks, 1):
-        embeddings.append(llm.embed([ch.text])[0])
-        texts.append(ch.text)
-        ids.append(ch.id)
-        metadatas.append({
-            "note_path": ch.note_path,
-            "note_title": ch.note_title,
-            "section": ch.section or "",
-        })
+    # Pick the work. A chunk needs embedding iff its ID is new OR its
+    # source note's mtime has moved since we stored it.
+    to_embed: list[Chunk] = []
+    for c in chunks:
+        prev = existing.get(c.id)
+        if prev is None:
+            to_embed.append(c)
+            continue
+        stored_mtime = prev.get("note_mtime")
+        if stored_mtime is None or float(stored_mtime) != float(note_mtimes[c.note_path]):
+            to_embed.append(c)
+
+    # Orphan cleanup. Anything in Chroma that the current parse no longer
+    # produces is stale — either the note was deleted or a section was
+    # renamed (which changes the chunk ID).
+    orphan_ids = [cid for cid in existing if cid not in current_ids]
+    if orphan_ids:
+        collection.delete(ids=orphan_ids)
+
+    # Embed + upsert in batches so a partial failure leaves the rest intact.
+    embedded = 0
+    total = len(to_embed)
+    for start in range(0, total, batch_size):
+        batch = to_embed[start:start + batch_size]
+        embeddings = [llm.embed([ch.text])[0] for ch in batch]
+        collection.upsert(
+            ids=[ch.id for ch in batch],
+            embeddings=embeddings,
+            documents=[ch.text for ch in batch],
+            metadatas=[{
+                "note_path": ch.note_path,
+                "note_title": ch.note_title,
+                "section": ch.section or "",
+                "note_mtime": note_mtimes[ch.note_path],
+            } for ch in batch],
+        )
+        embedded += len(batch)
         if progress:
-            progress(i, total)
+            progress(embedded, total)
 
-    collection.upsert(
-        ids=ids,
-        embeddings=embeddings,
-        documents=texts,
-        metadatas=metadatas,
-    )
-    return {"notes": len(notes), "chunks": total}
+    return {
+        "notes": len(notes),
+        "chunks": len(chunks),
+        "embedded": embedded,
+        "removed": len(orphan_ids),
+        "unchanged": len(chunks) - embedded,
+    }
+
+
+def _existing_chunk_summary(collection) -> dict[str, dict]:
+    """All chunk IDs currently in the collection with their stored metadata.
+    Used by incremental sync to decide what to skip and what to delete."""
+    count = collection.count()
+    if count == 0:
+        return {}
+    res = collection.get(include=["metadatas"], limit=count)
+    ids = res.get("ids", []) or []
+    metas = res.get("metadatas", []) or []
+    return {cid: (meta or {}) for cid, meta in zip(ids, metas)}
 
 
 @dataclass
