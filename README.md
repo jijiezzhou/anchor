@@ -26,7 +26,7 @@ The graph is **the most expensive training data you already wrote**. Throwing it
 
 ## Status
 
-🟢 **Weeks 1–3 shipped.** Naive vector RAG baseline → persistent SQLite graph store with FTS5 BM25 → hybrid retrieval fusing vector + BM25 + tag + title via Reciprocal Rank Fusion into a ≤30-candidate seed set. Weeks 4–8 land progressively.
+🟢 **Weeks 1–4 shipped.** Naive vector RAG baseline → persistent SQLite graph store with FTS5 BM25 → hybrid retrieval fusing vector + BM25 + tag + title via Reciprocal Rank Fusion into a ≤30-candidate seed set → **edge-weighted 1–2 hop graph walk + structural re-rank + graph-crumb prompt packing**. Weeks 5–8 land progressively.
 
 ## Quick start
 
@@ -51,8 +51,9 @@ uv run anchor index    tests/fixtures/vault                # embed every chunk (
 uv run anchor sync     tests/fixtures/vault                # populate SQLite graph DB (week 2)
 uv run anchor search   "chunker bug" --vault tests/fixtures/vault          # BM25 over the graph
 uv run anchor retrieve "chunker bug" --vault tests/fixtures/vault          # hybrid seed set (week 3)
+uv run anchor expand   "chunker bug" --vault tests/fixtures/vault          # hybrid + graph walk (week 4)
 uv run anchor ask      "What was the chunker bug in Lantern and how was it fixed?" \
-    --vault tests/fixtures/vault --hybrid --show-hits
+    --vault tests/fixtures/vault --graph --show-hits
 ```
 
 Point at your own vault instead:
@@ -86,7 +87,7 @@ ANCHOR_BACKEND=anthropic anchor ask "Summarize my notes about evals"
 | 1 ✅ | Vault parsing + the naive RAG strawman | `anchor parse / index / ask` | Two-pass parser (Note model, wikilinks, tags, frontmatter, backlinks) + naive vector baseline |
 | 2 ✅ | SQLite graph index, Pydantic everywhere | `anchor sync / search` — persistent graph + incremental upsert | `~/.anchor/graph/<vault>.db` with FTS5 BM25, mtime-keyed diff, link reconciliation |
 | 3 ✅ | Hybrid retrieval — vector + BM25 + tag + title | `anchor retrieve`, `anchor ask --hybrid` | 4 parallel retrievers fused with RRF, ≤30-candidate seed set, per-source attribution |
-| 4 | **Retrieval as traversal** — graph expansion | Edge-weighted 1-2 hop walk over backlinks + shared-tag jaccard | The lesson the whole project is built around |
+| 4 ✅ | **Retrieval as traversal** — graph expansion | `anchor expand`, `anchor ask --graph` — edge-weighted 1-2 hop walk + structural re-rank + graph-crumb prompt | The lesson the whole project is built around |
 | 5 | Query classifier — routing patterns | Lookup vs synthesis vs exploration; pick a retriever per query | Not every query wants the same pipeline |
 | 6 | Production hygiene — incremental indexing | fs-watcher, idempotent updates, partial-failure recovery | `anchor watch` |
 | 7 | Evals without labeled data | Synthetic Q&A from graph-connected note pairs; MRR + LLM-as-judge | `anchor eval` |
@@ -94,7 +95,7 @@ ANCHOR_BACKEND=anthropic anchor ask "Summarize my notes about evals"
 
 Each `weeks/NN-name/` folder contains the concept walkthrough, runnable code, and a checkpoint that plugs into the capstone.
 
-### Architecture (target — week 4+)
+### Architecture (shipped through week 4)
 
 ```
 query
@@ -132,7 +133,7 @@ query
 
 The **graph crumbs** in step 4 are the trick: the LLM sees not just the note but "this note links to [[X]] and is linked from [[Y]]." That's how it learns to suggest the next note to open — the whole point of using your second brain.
 
-## The killer demo (target — week 4+)
+## The killer demo
 
 Three query shapes vector-only RAG handles badly:
 
@@ -162,11 +163,12 @@ Week 1 ships #1 with the naive baseline so you can feel why it's not enough.
 │   │   ├── naive.py              vector top-k (week 1)
 │   │   ├── tag.py                tag/frontmatter retriever (week 3)
 │   │   ├── title.py              fuzzy title retriever (week 3)
-│   │   └── hybrid.py             RRF fusion over all four retrievers (week 3)
+│   │   ├── hybrid.py             RRF fusion over all four retrievers (week 3)
+│   │   └── graph_walk.py         edge-weighted 1-2 hop walk + structural re-rank (week 4)
 │   ├── synth/
-│   │   └── answer.py             prompt pack + cite-by-path
+│   │   └── answer.py             prompt pack + cite-by-path; graph-crumb variant (week 4)
 │   ├── llm.py                    Ollama + Anthropic, mirrors Lantern
-│   └── cli.py                    `anchor parse / index / sync / search / retrieve / ask / chat`
+│   └── cli.py                    `anchor parse / index / sync / search / retrieve / expand / ask / chat`
 ├── tests/
 │   ├── fixtures/vault/           21-note synthetic vault, links + tags + frontmatter
 │   ├── test_wikilinks.py
@@ -175,11 +177,13 @@ Week 1 ships #1 with the naive baseline so you can feel why it's not enough.
 │   ├── test_graph.py
 │   ├── test_retrieve_tag.py
 │   ├── test_retrieve_title.py
-│   └── test_retrieve_hybrid.py
+│   ├── test_retrieve_hybrid.py
+│   └── test_graph_walk.py
 └── weeks/
     ├── 01-baseline/              concept walkthrough + exercise
     ├── 02-graph-store/           SQLite + FTS5 walkthrough + exercise
-    └── 03-hybrid/                RRF fusion walkthrough + exercise
+    ├── 03-hybrid/                RRF fusion walkthrough + exercise
+    └── 04-graph-walk/            graph expansion + crumbs walkthrough + exercise
 ```
 
 State lives under `~/.anchor/`: Chroma collection per vault at `~/.anchor/chroma/`, SQLite graph DB per vault at `~/.anchor/graph/<vault>.db`. Nothing leaves your machine on the default Ollama backend.

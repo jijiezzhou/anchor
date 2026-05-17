@@ -1,13 +1,14 @@
 """Anchor CLI — entry point for the cumulative capstone.
 
-Subcommands grow each week. Today (weeks 1–3):
+Subcommands grow each week. Today (weeks 1–4):
 
     anchor parse    <vault>             show parsed-graph stats (notes, links, tags, broken)
     anchor index    <vault>             embed every chunk into the local vector store
     anchor sync     <vault>             upsert vault into the SQLite graph DB (incremental)
     anchor search   "..." --vault PATH  BM25 lexical hits from the graph DB
     anchor retrieve "..." --vault PATH  hybrid (vector+BM25+tag+title) seed set
-    anchor ask      "..." --vault PATH  retrieve + answer (--hybrid for week-3 stack)
+    anchor expand   "..." --vault PATH  hybrid → graph walk (1-2 hops), week-4 full retrieval
+    anchor ask      "..." --vault PATH  retrieve + answer (--hybrid / --graph)
     anchor chat     "..."               bare LLM call, useful for sanity-checking the backend
 
 Backends:
@@ -236,6 +237,67 @@ def retrieve_cmd(
     console.print(table)
 
 
+@app.command("expand")
+def expand_cmd(
+    query: str = typer.Argument(..., help="Query to seed the graph walk."),
+    vault: Path = typer.Option(
+        None, "-v", "--vault",
+        help="Vault root. Defaults to $ANCHOR_VAULT.",
+    ),
+    limit: int = typer.Option(20, "-k", "--limit", min=1, max=200),
+    seed_limit: int = typer.Option(15, "--seed", min=1, max=100,
+                                    help="Seeds fed into the walk from the hybrid layer."),
+    max_hops: int = typer.Option(2, "--hops", min=1, max=3),
+    no_vector: bool = typer.Option(
+        False, "--no-vector",
+        help="Skip the vector retriever (no Ollama needed).",
+    ),
+):
+    """Run the week-4 pipeline: hybrid seed set → 1-2 hop graph walk → re-rank."""
+    from anchor.retrieve.graph_walk import expand
+    from anchor.retrieve.hybrid import hybrid_search
+
+    vault_resolved = (vault or _default_vault()).resolve()
+    seeds = hybrid_search(
+        query, vault=vault_resolved, limit=seed_limit, include_vector=not no_vector
+    )
+    if not seeds:
+        console.print(
+            "(no seeds — did you run `anchor sync` and `anchor index` first?)"
+        )
+        return
+
+    candidates = expand(
+        seeds, vault=vault_resolved, query=query, max_hops=max_hops, limit=limit
+    )
+
+    table = Table(
+        title=f"Graph-expanded set ({len(candidates)})  seeds={len(seeds)}  hops≤{max_hops}",
+        title_style="bold",
+    )
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Path", style="cyan")
+    table.add_column("Title")
+    table.add_column("Origin")
+    table.add_column("Seed", justify="right")
+    table.add_column("Walk", justify="right")
+    table.add_column("Feat", justify="right")
+    table.add_column("Final", justify="right")
+    for i, c in enumerate(candidates, 1):
+        origin = "seed" if c.in_seed else f"hop-{c.hop_distance}"
+        edges = ",".join(sorted({kind for _, kind, _ in c.reached_via}))
+        if edges:
+            origin += f" ({edges})"
+        table.add_row(
+            str(i), c.path, c.title, origin,
+            f"{c.seed_score:.3f}",
+            f"{c.walk_score:.3f}",
+            f"{c.feature_score:.3f}",
+            f"{c.final_score:.3f}",
+        )
+    console.print(table)
+
+
 @app.command("ask")
 def ask_cmd(
     question: str = typer.Argument(..., help="Question to ask the vault."),
@@ -250,7 +312,11 @@ def ask_cmd(
     ),
     hybrid: bool = typer.Option(
         False, "--hybrid",
-        help="Use the week-3 four-retriever hybrid stack instead of naive vector.",
+        help="Use the week-3 four-retriever hybrid stack (no graph walk).",
+    ),
+    graph: bool = typer.Option(
+        False, "--graph",
+        help="Use the week-4 full pipeline: hybrid → graph expand → crumb-packed answer.",
     ),
     backend: str = typer.Option(None, "--backend",
                                  help="Override ANCHOR_BACKEND."),
@@ -258,22 +324,34 @@ def ask_cmd(
                                help="Override the default model."),
 ):
     """Retrieve relevant notes and answer the question. Default: week-1 naive
-    vector. Pass --hybrid for the week-3 four-retriever fusion."""
+    vector. Pass --hybrid for the week-3 fusion, --graph for the full
+    week-4 pipeline (hybrid + expansion + graph crumbs in the prompt)."""
     from anchor.retrieve.naive import search
-    from anchor.synth.answer import answer as synth_answer
+    from anchor.synth.answer import answer as synth_answer, answer_with_graph
+
+    if hybrid and graph:
+        raise typer.BadParameter("--hybrid and --graph are mutually exclusive (--graph already runs hybrid as its seed stage).")
 
     vault_resolved = (vault or _default_vault()).resolve()
     if not vault_resolved.is_dir():
         raise typer.BadParameter(f"vault is not a directory: {vault_resolved}")
 
     llm = LLM(model=model, backend=backend)
-    mode = "hybrid" if hybrid else "naive-vector"
+    mode = "graph" if graph else ("hybrid" if hybrid else "naive-vector")
     console.print(
         f"[dim]→ {llm.backend}:{llm.model}  vault={vault_resolved}  mode={mode}  k={top_k}[/dim]\n"
     )
 
     started = time.perf_counter()
-    if hybrid:
+    if graph:
+        from anchor.retrieve.graph_walk import expand
+        from anchor.retrieve.hybrid import hybrid_search
+        seeds = hybrid_search(question, vault=vault_resolved, limit=15, llm=llm)
+        candidates = expand(
+            seeds, vault=vault_resolved, query=question, limit=top_k
+        )
+        hits = None  # graph path bypasses the Hit-based pack; see below
+    elif hybrid:
         from anchor.retrieve.hybrid import hybrid_search, materialize
         candidates = hybrid_search(
             question, vault=vault_resolved, limit=top_k, llm=llm
@@ -284,7 +362,22 @@ def ask_cmd(
     retrieved_at = time.perf_counter()
 
     if show_hits:
-        if not hits:
+        if graph:
+            if not candidates:
+                console.print("(no candidates — did you run `anchor sync` and `anchor index` first?)\n")
+            else:
+                console.print("[bold]Expanded candidates[/bold]")
+                for c in candidates:
+                    origin = "seed" if c.in_seed else f"hop-{c.hop_distance}"
+                    console.print(
+                        f"\n[cyan]{c.path}[/cyan]  [dim]{origin}  final={c.final_score:.3f}[/dim]"
+                    )
+                    if c.out_titles:
+                        console.print(f"  [dim]→ {', '.join(c.out_titles[:4])}[/dim]")
+                    if c.back_titles:
+                        console.print(f"  [dim]← {', '.join(c.back_titles[:4])}[/dim]")
+                console.print("\n[bold]Answer[/bold]")
+        elif not hits:
             hint = "`anchor sync` and `anchor index`" if hybrid else "`anchor index`"
             console.print(f"(no hits — did you run {hint} first?)\n")
         else:
@@ -299,14 +392,18 @@ def ask_cmd(
                 console.print(f"[dim]{preview}[/dim]")
             console.print("\n[bold]Answer[/bold]")
 
-    result = synth_answer(question, hits, llm=llm)
+    if graph:
+        result = answer_with_graph(question, candidates, vault=vault_resolved, llm=llm)
+    else:
+        result = synth_answer(question, hits, llm=llm)
     elapsed = time.perf_counter() - started
     retrieval_ms = (retrieved_at - started) * 1000
 
     console.print(result.text)
+    hit_count = len(result.hits)
     console.print(
         f"\n[dim]({elapsed:.2f}s total; {retrieval_ms:.0f} ms retrieval; "
-        f"{len(hits)} hit{'s' if len(hits) != 1 else ''})[/dim]"
+        f"{hit_count} note{'s' if hit_count != 1 else ''})[/dim]"
     )
 
 
