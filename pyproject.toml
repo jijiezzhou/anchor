@@ -1,6 +1,6 @@
 [project]
 name = "anchor"
-version = "0.1.0"
+version = "0.8.0"
 description = "Graph-aware RAG for personal markdown vaults. Your wikilinks are training data — stop throwing them away."
 readme = "README.md"
 requires-python = ">=3.11"
