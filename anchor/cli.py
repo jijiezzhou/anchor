@@ -1,13 +1,14 @@
 """Anchor CLI — entry point for the cumulative capstone.
 
-Subcommands grow each week. Today (weeks 1–2):
+Subcommands grow each week. Today (weeks 1–3):
 
-    anchor parse  <vault>             show parsed-graph stats (notes, links, tags, broken)
-    anchor index  <vault>             embed every chunk into the local vector store
-    anchor sync   <vault>             upsert vault into the SQLite graph DB (incremental)
-    anchor search "..." --vault PATH  BM25 lexical hits from the graph DB
-    anchor ask    "..." --vault PATH  retrieve + answer (naive vector baseline)
-    anchor chat   "..."               bare LLM call, useful for sanity-checking the backend
+    anchor parse    <vault>             show parsed-graph stats (notes, links, tags, broken)
+    anchor index    <vault>             embed every chunk into the local vector store
+    anchor sync     <vault>             upsert vault into the SQLite graph DB (incremental)
+    anchor search   "..." --vault PATH  BM25 lexical hits from the graph DB
+    anchor retrieve "..." --vault PATH  hybrid (vector+BM25+tag+title) seed set
+    anchor ask      "..." --vault PATH  retrieve + answer (--hybrid for week-3 stack)
+    anchor chat     "..."               bare LLM call, useful for sanity-checking the backend
 
 Backends:
     ANCHOR_BACKEND=ollama     (default; requires Ollama running)
@@ -197,6 +198,44 @@ def search_cmd(
         )
 
 
+@app.command("retrieve")
+def retrieve_cmd(
+    query: str = typer.Argument(..., help="Query to send through the hybrid stack."),
+    vault: Path = typer.Option(
+        None, "-v", "--vault",
+        help="Vault root. Defaults to $ANCHOR_VAULT.",
+    ),
+    limit: int = typer.Option(30, "-k", "--limit", min=1, max=200),
+    no_vector: bool = typer.Option(
+        False, "--no-vector",
+        help="Skip the vector retriever (no Ollama needed).",
+    ),
+):
+    """Show the week-3 hybrid seed set with per-retriever attribution."""
+    from anchor.retrieve.hybrid import hybrid_search
+
+    vault_resolved = (vault or _default_vault()).resolve()
+    candidates = hybrid_search(
+        query, vault=vault_resolved, limit=limit, include_vector=not no_vector
+    )
+    if not candidates:
+        console.print(
+            "(no candidates — did you run `anchor sync` and `anchor index` first?)"
+        )
+        return
+
+    table = Table(title=f"Hybrid seed set ({len(candidates)})", title_style="bold")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Path", style="cyan")
+    table.add_column("Title")
+    table.add_column("Sources", style="green")
+    table.add_column("RRF", justify="right")
+    for i, c in enumerate(candidates, 1):
+        sources = " ".join(f"{name}#{c.ranks[name]}" for name in sorted(c.ranks))
+        table.add_row(str(i), c.path, c.title, sources, f"{c.score:.4f}")
+    console.print(table)
+
+
 @app.command("ask")
 def ask_cmd(
     question: str = typer.Argument(..., help="Question to ask the vault."),
@@ -204,17 +243,22 @@ def ask_cmd(
         None, "-v", "--vault",
         help="Vault root. Defaults to $ANCHOR_VAULT.",
     ),
-    top_k: int = typer.Option(5, "-k", "--top-k", min=1, max=20),
+    top_k: int = typer.Option(5, "-k", "--top-k", min=1, max=30),
     show_hits: bool = typer.Option(
         False, "--show-hits",
         help="Print the retrieved chunks before the answer.",
+    ),
+    hybrid: bool = typer.Option(
+        False, "--hybrid",
+        help="Use the week-3 four-retriever hybrid stack instead of naive vector.",
     ),
     backend: str = typer.Option(None, "--backend",
                                  help="Override ANCHOR_BACKEND."),
     model: str = typer.Option(None, "--model",
                                help="Override the default model."),
 ):
-    """Retrieve relevant notes and answer the question (week 1: naive vector RAG)."""
+    """Retrieve relevant notes and answer the question. Default: week-1 naive
+    vector. Pass --hybrid for the week-3 four-retriever fusion."""
     from anchor.retrieve.naive import search
     from anchor.synth.answer import answer as synth_answer
 
@@ -223,17 +267,26 @@ def ask_cmd(
         raise typer.BadParameter(f"vault is not a directory: {vault_resolved}")
 
     llm = LLM(model=model, backend=backend)
+    mode = "hybrid" if hybrid else "naive-vector"
     console.print(
-        f"[dim]→ {llm.backend}:{llm.model}  vault={vault_resolved}  k={top_k}[/dim]\n"
+        f"[dim]→ {llm.backend}:{llm.model}  vault={vault_resolved}  mode={mode}  k={top_k}[/dim]\n"
     )
 
     started = time.perf_counter()
-    hits = search(question, vault=vault_resolved, top_k=top_k, llm=llm)
+    if hybrid:
+        from anchor.retrieve.hybrid import hybrid_search, materialize
+        candidates = hybrid_search(
+            question, vault=vault_resolved, limit=top_k, llm=llm
+        )
+        hits = materialize(candidates, vault=vault_resolved)
+    else:
+        hits = search(question, vault=vault_resolved, top_k=top_k, llm=llm)
     retrieved_at = time.perf_counter()
 
     if show_hits:
         if not hits:
-            console.print("(no hits — did you run `anchor index` first?)\n")
+            hint = "`anchor sync` and `anchor index`" if hybrid else "`anchor index`"
+            console.print(f"(no hits — did you run {hint} first?)\n")
         else:
             console.print("[bold]Retrieved chunks[/bold]")
             for h in hits:

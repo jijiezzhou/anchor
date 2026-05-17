@@ -26,7 +26,7 @@ The graph is **the most expensive training data you already wrote**. Throwing it
 
 ## Status
 
-🟢 **Weeks 1–2 shipped.** Vault parser + naive vector RAG baseline (the strawman the rest of the curriculum beats), then a persistent SQLite graph store with FTS5 BM25 and incremental mtime-keyed sync. Weeks 3–8 land progressively.
+🟢 **Weeks 1–3 shipped.** Naive vector RAG baseline → persistent SQLite graph store with FTS5 BM25 → hybrid retrieval fusing vector + BM25 + tag + title via Reciprocal Rank Fusion into a ≤30-candidate seed set. Weeks 4–8 land progressively.
 
 ## Quick start
 
@@ -46,12 +46,13 @@ cd anchor
 uv sync
 
 # 4. Try the bundled commands against the synthetic vault
-uv run anchor parse  tests/fixtures/vault                # show graph stats
-uv run anchor index  tests/fixtures/vault                # embed every chunk (week 1)
-uv run anchor sync   tests/fixtures/vault                # populate SQLite graph DB (week 2)
-uv run anchor search "chunker bug" --vault tests/fixtures/vault   # BM25 over the graph
-uv run anchor ask    "What was the chunker bug in Lantern and how was it fixed?" \
-    --vault tests/fixtures/vault --show-hits
+uv run anchor parse    tests/fixtures/vault                # show graph stats
+uv run anchor index    tests/fixtures/vault                # embed every chunk (week 1)
+uv run anchor sync     tests/fixtures/vault                # populate SQLite graph DB (week 2)
+uv run anchor search   "chunker bug" --vault tests/fixtures/vault          # BM25 over the graph
+uv run anchor retrieve "chunker bug" --vault tests/fixtures/vault          # hybrid seed set (week 3)
+uv run anchor ask      "What was the chunker bug in Lantern and how was it fixed?" \
+    --vault tests/fixtures/vault --hybrid --show-hits
 ```
 
 Point at your own vault instead:
@@ -84,7 +85,7 @@ ANCHOR_BACKEND=anthropic anchor ask "Summarize my notes about evals"
 |-----:|-----------|-----------|--------------|
 | 1 ✅ | Vault parsing + the naive RAG strawman | `anchor parse / index / ask` | Two-pass parser (Note model, wikilinks, tags, frontmatter, backlinks) + naive vector baseline |
 | 2 ✅ | SQLite graph index, Pydantic everywhere | `anchor sync / search` — persistent graph + incremental upsert | `~/.anchor/graph/<vault>.db` with FTS5 BM25, mtime-keyed diff, link reconciliation |
-| 3 | Hybrid retrieval — vector + BM25 + tags | 4 parallel retrievers, union + score-normalize | Seed set under 30 candidates |
+| 3 ✅ | Hybrid retrieval — vector + BM25 + tag + title | `anchor retrieve`, `anchor ask --hybrid` | 4 parallel retrievers fused with RRF, ≤30-candidate seed set, per-source attribution |
 | 4 | **Retrieval as traversal** — graph expansion | Edge-weighted 1-2 hop walk over backlinks + shared-tag jaccard | The lesson the whole project is built around |
 | 5 | Query classifier — routing patterns | Lookup vs synthesis vs exploration; pick a retriever per query | Not every query wants the same pipeline |
 | 6 | Production hygiene — incremental indexing | fs-watcher, idempotent updates, partial-failure recovery | `anchor watch` |
@@ -158,20 +159,27 @@ Week 1 ships #1 with the naive baseline so you can feel why it's not enough.
 │   │   ├── vectors.py            Chroma + Ollama embeddings (naive baseline, week 1)
 │   │   └── graph.py              SQLite graph store + FTS5 BM25, incremental sync (week 2)
 │   ├── retrieve/
-│   │   └── naive.py              vector top-k
+│   │   ├── naive.py              vector top-k (week 1)
+│   │   ├── tag.py                tag/frontmatter retriever (week 3)
+│   │   ├── title.py              fuzzy title retriever (week 3)
+│   │   └── hybrid.py             RRF fusion over all four retrievers (week 3)
 │   ├── synth/
 │   │   └── answer.py             prompt pack + cite-by-path
 │   ├── llm.py                    Ollama + Anthropic, mirrors Lantern
-│   └── cli.py                    `anchor parse / index / sync / search / ask / chat`
+│   └── cli.py                    `anchor parse / index / sync / search / retrieve / ask / chat`
 ├── tests/
 │   ├── fixtures/vault/           21-note synthetic vault, links + tags + frontmatter
 │   ├── test_wikilinks.py
 │   ├── test_tags.py
 │   ├── test_vault.py
-│   └── test_graph.py
+│   ├── test_graph.py
+│   ├── test_retrieve_tag.py
+│   ├── test_retrieve_title.py
+│   └── test_retrieve_hybrid.py
 └── weeks/
     ├── 01-baseline/              concept walkthrough + exercise
-    └── 02-graph-store/           SQLite + FTS5 walkthrough + exercise
+    ├── 02-graph-store/           SQLite + FTS5 walkthrough + exercise
+    └── 03-hybrid/                RRF fusion walkthrough + exercise
 ```
 
 State lives under `~/.anchor/`: Chroma collection per vault at `~/.anchor/chroma/`, SQLite graph DB per vault at `~/.anchor/graph/<vault>.db`. Nothing leaves your machine on the default Ollama backend.
