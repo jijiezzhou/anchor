@@ -1,6 +1,6 @@
 """Anchor CLI — entry point for the cumulative capstone.
 
-Subcommands grow each week. Today (weeks 1–6):
+Subcommands grow each week. Today (weeks 1–7):
 
     anchor parse    <vault>             show parsed-graph stats (notes, links, tags, broken)
     anchor index    <vault>             embed only what changed (incremental; --rebuild for full)
@@ -11,6 +11,7 @@ Subcommands grow each week. Today (weeks 1–6):
     anchor expand   "..." --vault PATH  hybrid → graph walk (1-2 hops), week-4 full retrieval
     anchor route    "..."               week-5 router: classify lookup / synthesis / exploration
     anchor ask      "..." --vault PATH  retrieve + answer (default: route; --hybrid / --graph force a mode)
+    anchor eval     {generate,run,show} week-7 eval suite — MRR/Recall@k + LLM-as-judge
     anchor chat     "..."               bare LLM call, useful for sanity-checking the backend
 
 Backends:
@@ -35,6 +36,12 @@ app = typer.Typer(
     add_completion=False,
     help="Anchor — graph-aware RAG for personal markdown vaults.",
 )
+eval_app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    help="Synthetic Q&A + per-pipeline scoring (week 7).",
+)
+app.add_typer(eval_app, name="eval")
 console = Console()
 
 
@@ -604,6 +611,183 @@ def chat_cmd(
     for chunk in llm.stream(prompt, temperature=temperature, system=system):
         console.print(chunk, end="", soft_wrap=True, highlight=False, markup=False)
     console.print()
+
+
+@eval_app.command("generate")
+def eval_generate_cmd(
+    vault: Path = typer.Option(
+        None, "-v", "--vault",
+        help="Vault root. Defaults to $ANCHOR_VAULT.",
+    ),
+    pair_limit: int = typer.Option(
+        12, "--pairs", min=0, max=200,
+        help="Number of link-pair questions (sampled). 0 = single-note only.",
+    ),
+    single_limit: int = typer.Option(
+        None, "--singles", min=0, max=2000,
+        help="Cap single-note questions (default: one per note).",
+    ),
+    seed: int = typer.Option(0, "--seed", help="Sampling seed for pair selection."),
+    regen: bool = typer.Option(
+        False, "--regen",
+        help="Wipe the existing cache before generating.",
+    ),
+    backend: str = typer.Option(None, "--backend"),
+    model: str = typer.Option(None, "--model"),
+):
+    """Generate the synthetic Q&A set and append it to the per-vault cache."""
+    from anchor.eval import qa_path_for
+    from anchor.eval.generate import generate_qa
+    from anchor.eval.store import save_qa
+
+    vault_resolved = (vault or _default_vault()).resolve()
+    cache = qa_path_for(vault_resolved)
+    if regen and cache.exists():
+        cache.unlink()
+
+    llm = LLM(model=model, backend=backend)
+    console.print(
+        f"[dim]→ generating Q&A for {vault_resolved}\n"
+        f"  llm: {llm.backend}:{llm.model}\n"
+        f"  cache: {cache}{'  (wiped)' if regen else ''}[/dim]"
+    )
+
+    produced: list = []
+    def on_item(item):
+        produced.append(item)
+        save_qa([item], vault=vault_resolved, append=True)
+        kind_tag = "[cyan]single[/cyan]" if item.kind == "single" else "[magenta]pair[/magenta]"
+        gold = " + ".join(item.gold_paths) if item.kind == "pair" else item.gold_paths[0]
+        console.print(f"  {kind_tag}  {gold}  [dim]{item.question[:80]}[/dim]")
+
+    def on_skip(key, reason):
+        console.print(f"  [yellow]skip[/yellow]  {key}  [dim]{reason}[/dim]")
+
+    started = time.perf_counter()
+    generate_qa(
+        vault_resolved, llm=llm,
+        single_limit=single_limit, pair_limit=pair_limit, seed=seed,
+        on_item=on_item, on_skip=on_skip,
+    )
+    elapsed = time.perf_counter() - started
+
+    singles = sum(1 for q in produced if q.kind == "single")
+    pairs = sum(1 for q in produced if q.kind == "pair")
+    console.print(
+        f"\n[bold]Wrote {len(produced)} questions[/bold]  "
+        f"[dim]({singles} single, {pairs} pair) in {elapsed:.1f}s → {cache}[/dim]"
+    )
+
+
+@eval_app.command("show")
+def eval_show_cmd(
+    vault: Path = typer.Option(
+        None, "-v", "--vault",
+        help="Vault root. Defaults to $ANCHOR_VAULT.",
+    ),
+    limit: int = typer.Option(50, "-n", "--limit", min=1, max=2000),
+):
+    """Print the cached Q&A set."""
+    from anchor.eval import load_qa, qa_path_for
+
+    vault_resolved = (vault or _default_vault()).resolve()
+    qa = load_qa(vault_resolved)
+    cache = qa_path_for(vault_resolved)
+    if not qa:
+        console.print(f"(no eval cache at {cache} — run `anchor eval generate` first)")
+        return
+
+    table = Table(title=f"Eval Q&A ({len(qa)}) — {cache}", title_style="bold")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Kind")
+    table.add_column("Gold", style="cyan")
+    table.add_column("Question")
+    for i, q in enumerate(qa[:limit], 1):
+        kind_style = "cyan" if q.kind == "single" else "magenta"
+        gold = " + ".join(q.gold_paths) if q.kind == "pair" else q.gold_paths[0]
+        table.add_row(str(i), f"[{kind_style}]{q.kind}[/{kind_style}]", gold, q.question)
+    console.print(table)
+    if len(qa) > limit:
+        console.print(f"[dim]…and {len(qa) - limit} more[/dim]")
+
+
+@eval_app.command("run")
+def eval_run_cmd(
+    vault: Path = typer.Option(
+        None, "-v", "--vault",
+        help="Vault root. Defaults to $ANCHOR_VAULT.",
+    ),
+    pipeline: str = typer.Option(
+        "all", "--pipeline",
+        help="Which pipeline to score: naive, hybrid, graph, or all.",
+    ),
+    limit: int = typer.Option(
+        None, "-n", "--limit", min=1, max=2000,
+        help="Cap the number of Q&A items to score (useful for smoke tests).",
+    ),
+    no_judge: bool = typer.Option(
+        False, "--no-judge",
+        help="Skip the LLM-as-judge pass. Retrieval metrics only — fast.",
+    ),
+    top_k: int = typer.Option(10, "-k", "--top-k", min=1, max=50),
+    backend: str = typer.Option(None, "--backend"),
+    model: str = typer.Option(None, "--model"),
+):
+    """Score one or all pipelines against the cached Q&A set."""
+    from anchor.eval import load_qa
+    from anchor.eval.runner import PIPELINES, run_all
+
+    vault_resolved = (vault or _default_vault()).resolve()
+    qa = load_qa(vault_resolved)
+    if not qa:
+        raise typer.BadParameter(
+            "No eval cache. Run `anchor eval generate` first."
+        )
+    if limit is not None:
+        qa = qa[:limit]
+
+    pipelines = list(PIPELINES) if pipeline == "all" else [pipeline]
+    for p in pipelines:
+        if p not in PIPELINES:
+            raise typer.BadParameter(f"unknown pipeline {p!r}; pick from {PIPELINES} or 'all'")
+
+    llm = LLM(model=model, backend=backend)
+    console.print(
+        f"[dim]→ scoring {len(qa)} questions  "
+        f"pipelines={','.join(pipelines)}  judge={'off' if no_judge else 'on'}  "
+        f"llm={llm.backend}:{llm.model}[/dim]\n"
+    )
+
+    last_pct: dict[str, int] = {}
+    def on_progress(i: int, total: int, pipe: str) -> None:
+        pct = int(i * 100 / total)
+        prev = last_pct.get(pipe, -1)
+        if pct >= prev + 20 or i == total:
+            console.print(f"  [dim]{pipe}: {i}/{total} ({pct}%)[/dim]")
+            last_pct[pipe] = pct
+
+    report = run_all(
+        pipelines, qa, vault=vault_resolved, llm=llm,
+        judge=not no_judge, on_progress=on_progress, top_k=top_k,
+    )
+
+    table = Table(title=f"Eval results — {len(qa)} questions", title_style="bold")
+    table.add_column("Pipeline", style="cyan")
+    table.add_column("MRR", justify="right")
+    table.add_column("R@1", justify="right")
+    table.add_column("R@5", justify="right")
+    table.add_column("R@10", justify="right")
+    table.add_column("Judge", justify="right")
+    for s in report.scores:
+        judge_cell = f"{s.judge_mean:.2f}/5" if s.judge_mean is not None else "—"
+        table.add_row(
+            s.pipeline,
+            f"{s.mrr:.3f}", f"{s.recall_at_1:.3f}",
+            f"{s.recall_at_5:.3f}", f"{s.recall_at_10:.3f}",
+            judge_cell,
+        )
+    console.print(table)
+    console.print(f"\n[dim]elapsed {report.elapsed_s:.1f}s[/dim]")
 
 
 if __name__ == "__main__":

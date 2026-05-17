@@ -26,7 +26,7 @@ The graph is **the most expensive training data you already wrote**. Throwing it
 
 ## Status
 
-🟢 **Weeks 1–6 shipped.** Naive vector RAG baseline → persistent SQLite graph store with FTS5 BM25 → hybrid retrieval fusing vector + BM25 + tag + title via Reciprocal Rank Fusion into a ≤30-candidate seed set → edge-weighted 1–2 hop graph walk + structural re-rank + graph-crumb prompt packing → query router (lookup / synthesis / exploration) → **incremental vector indexing + polling fs-watcher (`anchor watch`) with per-batch partial-failure recovery**. Weeks 7–8 land progressively.
+🟢 **Weeks 1–7 shipped.** Naive vector RAG baseline → persistent SQLite graph store with FTS5 BM25 → hybrid retrieval fusing vector + BM25 + tag + title via Reciprocal Rank Fusion into a ≤30-candidate seed set → edge-weighted 1–2 hop graph walk + structural re-rank + graph-crumb prompt packing → query router (lookup / synthesis / exploration) → incremental vector indexing + polling fs-watcher (`anchor watch`) → **synthetic Q&A eval suite with MRR + Recall@k + LLM-as-judge per pipeline (`anchor eval`)**. Week 8 lands next.
 
 ## Quick start
 
@@ -56,6 +56,8 @@ uv run anchor route    "summarize my eval notes"                           # cla
 uv run anchor ask      "What was the chunker bug in Lantern and how was it fixed?" \
     --vault tests/fixtures/vault --show-hits         # router picks the pipeline (week 5)
 uv run anchor watch    tests/fixtures/vault                                # auto-resync on edit (week 6)
+uv run anchor eval generate --vault tests/fixtures/vault                   # synthetic Q&A (week 7)
+uv run anchor eval run      --vault tests/fixtures/vault --no-judge        # score all pipelines
 ```
 
 Point at your own vault instead:
@@ -92,7 +94,7 @@ ANCHOR_BACKEND=anthropic anchor ask "Summarize my notes about evals"
 | 4 ✅ | **Retrieval as traversal** — graph expansion | `anchor expand`, `anchor ask --graph` — edge-weighted 1-2 hop walk + structural re-rank + graph-crumb prompt | The lesson the whole project is built around |
 | 5 ✅ | Query classifier — routing patterns | `anchor route`, auto-routed `anchor ask` — rules-first + LLM fallback | Not every query wants the same pipeline |
 | 6 ✅ | Production hygiene — incremental indexing | `anchor watch` (polling), incremental `anchor index`, per-batch partial-failure recovery | The watcher closes the dev loop |
-| 7 | Evals without labeled data | Synthetic Q&A from graph-connected note pairs; MRR + LLM-as-judge | `anchor eval` |
+| 7 ✅ | Evals without labeled data | `anchor eval generate/run/show` — single-note + link-pair Q&A, MRR + Recall@k + LLM-as-judge per pipeline | Tune the weeks 1-6 weights with numbers, not vibes |
 | 8 | MCP server — make it usable from Claude Code / Cursor | `anchor mcp` over stdio | The "anyone can use this" surface |
 
 Each `weeks/NN-name/` folder contains the concept walkthrough, runnable code, and a checkpoint that plugs into the capstone.
@@ -171,8 +173,14 @@ Week 1 ships #1 with the naive baseline so you can feel why it's not enough.
 │   ├── synth/
 │   │   └── answer.py             prompt pack + cite-by-path; graph-crumb variant (week 4)
 │   ├── route.py                  query router: lookup / synthesis / exploration (week 5)
+│   ├── eval/                     synthetic Q&A + MRR/Recall@k + LLM-as-judge (week 7)
+│   │   ├── store.py              JSONL cache of generated questions
+│   │   ├── generate.py           single-note + link-pair generation
+│   │   ├── metrics.py            pure functions: MRR, Recall@k
+│   │   ├── judge.py              LLM-as-judge with 1-5 rubric
+│   │   └── runner.py             per-pipeline orchestration + scoring
 │   ├── llm.py                    Ollama + Anthropic, mirrors Lantern
-│   └── cli.py                    `anchor parse / index / sync / watch / search / retrieve / expand / route / ask / chat`
+│   └── cli.py                    `anchor parse / index / sync / watch / search / retrieve / expand / route / ask / eval / chat`
 ├── tests/
 │   ├── fixtures/vault/           21-note synthetic vault, links + tags + frontmatter
 │   ├── test_wikilinks.py
@@ -185,14 +193,16 @@ Week 1 ships #1 with the naive baseline so you can feel why it's not enough.
 │   ├── test_graph_walk.py
 │   ├── test_route.py
 │   ├── test_vectors_incremental.py
-│   └── test_watch.py
+│   ├── test_watch.py
+│   └── test_eval.py
 └── weeks/
     ├── 01-baseline/              concept walkthrough + exercise
     ├── 02-graph-store/           SQLite + FTS5 walkthrough + exercise
     ├── 03-hybrid/                RRF fusion walkthrough + exercise
     ├── 04-graph-walk/            graph expansion + crumbs walkthrough + exercise
     ├── 05-router/                query classifier walkthrough + exercise
-    └── 06-watch/                 incremental index + polling watcher walkthrough + exercise
+    ├── 06-watch/                 incremental index + polling watcher walkthrough + exercise
+    └── 07-eval/                  synthetic Q&A + MRR/Recall@k + LLM-judge walkthrough + exercise
 ```
 
 State lives under `~/.anchor/`: Chroma collection per vault at `~/.anchor/chroma/`, SQLite graph DB per vault at `~/.anchor/graph/<vault>.db`. Nothing leaves your machine on the default Ollama backend.
