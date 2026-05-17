@@ -1,11 +1,13 @@
 """Anchor CLI — entry point for the cumulative capstone.
 
-Subcommands grow each week. Today (week 1):
+Subcommands grow each week. Today (weeks 1–2):
 
-    anchor parse <vault>             show parsed-graph stats (notes, links, tags, broken)
-    anchor index <vault>             embed every chunk into the local vector store
-    anchor ask "..." --vault <path>  retrieve + answer (naive vector baseline)
-    anchor chat "..."                bare LLM call, useful for sanity-checking the backend
+    anchor parse  <vault>             show parsed-graph stats (notes, links, tags, broken)
+    anchor index  <vault>             embed every chunk into the local vector store
+    anchor sync   <vault>             upsert vault into the SQLite graph DB (incremental)
+    anchor search "..." --vault PATH  BM25 lexical hits from the graph DB
+    anchor ask    "..." --vault PATH  retrieve + answer (naive vector baseline)
+    anchor chat   "..."               bare LLM call, useful for sanity-checking the backend
 
 Backends:
     ANCHOR_BACKEND=ollama     (default; requires Ollama running)
@@ -128,6 +130,71 @@ def index_cmd(
         f"\n[bold]Indexed {stats['notes']} notes / {stats['chunks']} chunks[/bold] "
         f"[dim]in {elapsed:.1f}s[/dim]"
     )
+
+
+@app.command("sync")
+def sync_cmd(
+    vault: Path = typer.Argument(
+        ..., exists=True, file_okay=False, dir_okay=True, readable=True,
+        help="Path to the markdown vault root.",
+    ),
+    full: bool = typer.Option(
+        False, "--full",
+        help="Re-parse every note even if mtime matches (after a parser change).",
+    ),
+    verbose: bool = typer.Option(
+        False, "-v", "--verbose",
+        help="List the touched paths in addition to counts.",
+    ),
+):
+    """Sync the vault into the SQLite graph DB at ~/.anchor/graph/<vault>.db (week 2)."""
+    from anchor.index.graph import db_path_for, sync_vault
+
+    db = db_path_for(vault)
+    console.print(f"[dim]→ graph db: {db}[/dim]")
+
+    stats = sync_vault(vault, full=full)
+
+    table = Table(title="Sync result", title_style="bold")
+    table.add_column("State", style="cyan", no_wrap=True)
+    table.add_column("Count", justify="right")
+    table.add_row("Added", str(len(stats.added)))
+    table.add_row("Changed", str(len(stats.changed)))
+    table.add_row("Removed", str(len(stats.removed)))
+    table.add_row("Unchanged", str(stats.unchanged))
+    console.print(table)
+    console.print(f"[dim]synced in {stats.elapsed_s*1000:.0f} ms[/dim]")
+
+    if verbose:
+        for label, paths in (("added", stats.added), ("changed", stats.changed), ("removed", stats.removed)):
+            for p in paths:
+                console.print(f"  [yellow]{label:<8}[/yellow] {p}")
+
+
+@app.command("search")
+def search_cmd(
+    query: str = typer.Argument(..., help="Lexical query — passed to FTS5 BM25."),
+    vault: Path = typer.Option(
+        None, "-v", "--vault",
+        help="Vault root. Defaults to $ANCHOR_VAULT.",
+    ),
+    top_k: int = typer.Option(10, "-k", "--top-k", min=1, max=50),
+):
+    """BM25 search over the graph DB. Run `anchor sync` first (week 2)."""
+    from anchor.index.graph import bm25_search
+
+    vault_resolved = (vault or _default_vault()).resolve()
+    hits = bm25_search(vault_resolved, query, top_k=top_k)
+    if not hits:
+        console.print(
+            "(no matches — did you run `anchor sync` first, or try different words?)"
+        )
+        return
+    for h in hits:
+        console.print(
+            f"[cyan]{h.path}[/cyan]  [dim]bm25={h.score:.2f}[/dim]\n"
+            f"  [dim]{h.snippet}[/dim]"
+        )
 
 
 @app.command("ask")
