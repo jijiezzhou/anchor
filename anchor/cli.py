@@ -1,6 +1,6 @@
 """Anchor CLI — entry point for the cumulative capstone.
 
-Subcommands grow each week. Today (weeks 1–4):
+Subcommands grow each week. Today (weeks 1–5):
 
     anchor parse    <vault>             show parsed-graph stats (notes, links, tags, broken)
     anchor index    <vault>             embed every chunk into the local vector store
@@ -8,7 +8,8 @@ Subcommands grow each week. Today (weeks 1–4):
     anchor search   "..." --vault PATH  BM25 lexical hits from the graph DB
     anchor retrieve "..." --vault PATH  hybrid (vector+BM25+tag+title) seed set
     anchor expand   "..." --vault PATH  hybrid → graph walk (1-2 hops), week-4 full retrieval
-    anchor ask      "..." --vault PATH  retrieve + answer (--hybrid / --graph)
+    anchor route    "..."               week-5 router: classify lookup / synthesis / exploration
+    anchor ask      "..." --vault PATH  retrieve + answer (default: route; --hybrid / --graph force a mode)
     anchor chat     "..."               bare LLM call, useful for sanity-checking the backend
 
 Backends:
@@ -298,6 +299,43 @@ def expand_cmd(
     console.print(table)
 
 
+@app.command("route")
+def route_cmd(
+    query: str = typer.Argument(..., help="Query to classify."),
+    no_llm: bool = typer.Option(
+        False, "--no-llm",
+        help="Disable the LLM fallback (rules-only, deterministic).",
+    ),
+    backend: str = typer.Option(None, "--backend",
+                                 help="Override ANCHOR_BACKEND for the fallback LLM."),
+    model: str = typer.Option(None, "--model",
+                               help="Override the model used for the fallback."),
+):
+    """Classify a query with the week-5 router and show the picked pipeline."""
+    from anchor.route import apply, route
+
+    # Build the LLM lazily — only construct it if we'd actually use it,
+    # so `--no-llm` doesn't require Ollama to be running.
+    llm = None if no_llm else LLM(model=model, backend=backend)
+    decision = route(query, llm=llm, allow_llm_fallback=not no_llm)
+    params = apply(decision)
+
+    table = Table(title=f"Routing decision  source={decision.source}", title_style="bold")
+    table.add_column("Field", style="cyan", no_wrap=True)
+    table.add_column("Value")
+    table.add_row("intent", decision.intent.value)
+    table.add_row("confidence", f"{decision.confidence:.3f}")
+    table.add_row("pipeline", str(params.pop("pipeline")))
+    table.add_row("params", ", ".join(f"{k}={v}" for k, v in params.items()) or "—")
+    if decision.raw_scores:
+        scores = ", ".join(f"{i.value}={s:.2f}" for i, s in decision.raw_scores.items() if s > 0)
+        table.add_row("raw_scores", scores or "—")
+    if decision.signals:
+        sigs = ", ".join(f"{s.name}({s.intent.value}+{s.weight})" for s in decision.signals)
+        table.add_row("signals", sigs)
+    console.print(table)
+
+
 @app.command("ask")
 def ask_cmd(
     question: str = typer.Argument(..., help="Question to ask the vault."),
@@ -305,64 +343,115 @@ def ask_cmd(
         None, "-v", "--vault",
         help="Vault root. Defaults to $ANCHOR_VAULT.",
     ),
-    top_k: int = typer.Option(5, "-k", "--top-k", min=1, max=30),
+    top_k: int = typer.Option(
+        None, "-k", "--top-k", min=1, max=30,
+        help="Override the router's top_k (or the per-mode default for --hybrid/--graph).",
+    ),
     show_hits: bool = typer.Option(
         False, "--show-hits",
         help="Print the retrieved chunks before the answer.",
     ),
+    naive: bool = typer.Option(
+        False, "--naive",
+        help="Force the week-1 naive vector pipeline (bypass the router).",
+    ),
     hybrid: bool = typer.Option(
         False, "--hybrid",
-        help="Use the week-3 four-retriever hybrid stack (no graph walk).",
+        help="Force the week-3 four-retriever hybrid stack (bypass the router).",
     ),
     graph: bool = typer.Option(
         False, "--graph",
-        help="Use the week-4 full pipeline: hybrid → graph expand → crumb-packed answer.",
+        help="Force the week-4 graph walk pipeline (bypass the router).",
+    ),
+    no_route_llm: bool = typer.Option(
+        False, "--no-route-llm",
+        help="Disable the router's LLM fallback (rules-only).",
     ),
     backend: str = typer.Option(None, "--backend",
                                  help="Override ANCHOR_BACKEND."),
     model: str = typer.Option(None, "--model",
                                help="Override the default model."),
 ):
-    """Retrieve relevant notes and answer the question. Default: week-1 naive
-    vector. Pass --hybrid for the week-3 fusion, --graph for the full
-    week-4 pipeline (hybrid + expansion + graph crumbs in the prompt)."""
+    """Retrieve relevant notes and answer the question.
+
+    By default the week-5 router classifies the question and picks
+    --hybrid or --graph with appropriate `top_k`. Pass --naive, --hybrid,
+    or --graph to force a specific pipeline. --naive matches the week-1
+    baseline; it's still useful to feel why the graph stack exists."""
     from anchor.retrieve.naive import search
+    from anchor.route import Intent, apply as route_apply, route as route_classify
     from anchor.synth.answer import answer as synth_answer, answer_with_graph
 
-    if hybrid and graph:
-        raise typer.BadParameter("--hybrid and --graph are mutually exclusive (--graph already runs hybrid as its seed stage).")
+    forced = [name for name, flag in (("naive", naive), ("hybrid", hybrid), ("graph", graph)) if flag]
+    if len(forced) > 1:
+        raise typer.BadParameter(
+            f"Only one of --naive / --hybrid / --graph may be set (got: {', '.join(forced)})."
+        )
 
     vault_resolved = (vault or _default_vault()).resolve()
     if not vault_resolved.is_dir():
         raise typer.BadParameter(f"vault is not a directory: {vault_resolved}")
 
     llm = LLM(model=model, backend=backend)
-    mode = "graph" if graph else ("hybrid" if hybrid else "naive-vector")
+
+    # Pick the pipeline + params. Forced flags win; otherwise the router
+    # decides. Default `top_k`s differ per pipeline (cheap for lookup,
+    # wide for exploration), but a CLI -k always overrides.
+    decision = None
+    if naive:
+        pipeline = "naive"
+        params: dict[str, int] = {"top_k": top_k or 5}
+    elif hybrid:
+        pipeline = "hybrid"
+        params = {"top_k": top_k or 8}
+    elif graph:
+        pipeline = "graph"
+        params = {"top_k": top_k or 8, "max_hops": 2, "seed_limit": 15}
+    else:
+        decision = route_classify(question, llm=llm, allow_llm_fallback=not no_route_llm)
+        applied = route_apply(decision)
+        pipeline = str(applied.pop("pipeline"))
+        params = {k: int(v) for k, v in applied.items()}     # type: ignore[arg-type]
+        if top_k is not None:
+            params["top_k"] = top_k
+
+    mode_label = pipeline
+    if decision is not None:
+        mode_label = (
+            f"{pipeline} (router→{decision.intent.value}, "
+            f"src={decision.source}, conf={decision.confidence:.2f})"
+        )
     console.print(
-        f"[dim]→ {llm.backend}:{llm.model}  vault={vault_resolved}  mode={mode}  k={top_k}[/dim]\n"
+        f"[dim]→ {llm.backend}:{llm.model}  vault={vault_resolved}  "
+        f"mode={mode_label}  k={params['top_k']}[/dim]\n"
     )
 
     started = time.perf_counter()
-    if graph:
+    if pipeline == "graph":
         from anchor.retrieve.graph_walk import expand
         from anchor.retrieve.hybrid import hybrid_search
-        seeds = hybrid_search(question, vault=vault_resolved, limit=15, llm=llm)
-        candidates = expand(
-            seeds, vault=vault_resolved, query=question, limit=top_k
+        seeds = hybrid_search(
+            question, vault=vault_resolved,
+            limit=params.get("seed_limit", 15), llm=llm,
         )
-        hits = None  # graph path bypasses the Hit-based pack; see below
-    elif hybrid:
+        candidates = expand(
+            seeds, vault=vault_resolved, query=question,
+            max_hops=params.get("max_hops", 2),
+            limit=params["top_k"],
+        )
+        hits = None
+    elif pipeline == "hybrid":
         from anchor.retrieve.hybrid import hybrid_search, materialize
         candidates = hybrid_search(
-            question, vault=vault_resolved, limit=top_k, llm=llm
+            question, vault=vault_resolved, limit=params["top_k"], llm=llm
         )
         hits = materialize(candidates, vault=vault_resolved)
-    else:
-        hits = search(question, vault=vault_resolved, top_k=top_k, llm=llm)
+    else:    # "naive"
+        hits = search(question, vault=vault_resolved, top_k=params["top_k"], llm=llm)
     retrieved_at = time.perf_counter()
 
     if show_hits:
-        if graph:
+        if pipeline == "graph":
             if not candidates:
                 console.print("(no candidates — did you run `anchor sync` and `anchor index` first?)\n")
             else:
@@ -378,7 +467,7 @@ def ask_cmd(
                         console.print(f"  [dim]← {', '.join(c.back_titles[:4])}[/dim]")
                 console.print("\n[bold]Answer[/bold]")
         elif not hits:
-            hint = "`anchor sync` and `anchor index`" if hybrid else "`anchor index`"
+            hint = "`anchor sync` and `anchor index`" if pipeline == "hybrid" else "`anchor index`"
             console.print(f"(no hits — did you run {hint} first?)\n")
         else:
             console.print("[bold]Retrieved chunks[/bold]")
@@ -392,7 +481,7 @@ def ask_cmd(
                 console.print(f"[dim]{preview}[/dim]")
             console.print("\n[bold]Answer[/bold]")
 
-    if graph:
+    if pipeline == "graph":
         result = answer_with_graph(question, candidates, vault=vault_resolved, llm=llm)
     else:
         result = synth_answer(question, hits, llm=llm)
