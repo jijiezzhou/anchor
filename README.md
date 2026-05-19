@@ -78,6 +78,27 @@ uv tool update-shell        # one-time PATH fix
 anchor ask "What was I thinking about last week?" --vault ~/notes
 ```
 
+Wire it into Claude Code / Desktop / Cursor (after `uv tool install`):
+
+```json
+// ~/.claude/mcp.json  (Claude Code)
+// ~/Library/Application Support/Claude/claude_desktop_config.json  (Claude Desktop, macOS)
+{
+  "mcpServers": {
+    "anchor": {
+      "command": "anchor",
+      "args": ["mcp"],
+      "env": {
+        "ANCHOR_VAULT": "/Users/you/notes",
+        "ANCHOR_BACKEND": "ollama"
+      }
+    }
+  }
+}
+```
+
+Restart the client. `anchor_ask` and `anchor_expand` appear in the tool list — ask a question in chat and the model decides when to reach into your vault. See [`weeks/08-mcp/README.md`](weeks/08-mcp/README.md) for Cursor and debugging notes.
+
 Frontier swap (better answers, embeddings still local):
 
 ```bash
