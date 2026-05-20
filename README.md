@@ -121,7 +121,9 @@ ANCHOR_BACKEND=anthropic anchor ask "Summarize my notes about evals"
 
 Each `weeks/NN-name/` folder contains the concept walkthrough, runnable code, and a checkpoint that plugs into the capstone.
 
-### Architecture (shipped through week 4)
+### Architecture — the core retrieval pipeline (weeks 1–4)
+
+Weeks 5–8 wrap this pipeline rather than extend the diagram: the router (week 5) picks how to enter it, the watcher (week 6) keeps its indexes fresh, the eval suite (week 7) scores it, and the MCP server (week 8) exposes it.
 
 ```
 query
